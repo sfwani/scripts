@@ -4,8 +4,8 @@
 # This script performs two primary functions:
 #   1. Process Mode (default): Back up critical files, then list non-root accounts (UID >= threshold),
 #      letting you choose which accounts to keep, and then either disable or delete the rest.
-#      Disabled accounts are logged for later re-enablement.
-#      Deleted accounts are logged for forensic reference.
+#      - Disabled accounts are logged for later re-enablement (in /root/disabled_accounts.list).
+#      - Deleted accounts are logged for forensic reference (in /root/deleted_accounts.list).
 #
 #   2. Re-enable Mode (--reenable): Display disabled accounts, let you choose which ones to re-enable,
 #      and update the disabled accounts list accordingly.
@@ -24,19 +24,39 @@ fi
 DISABLED_FILE="/root/disabled_accounts.list"
 DELETED_FILE="/root/deleted_accounts.list"
 
+# Log file for capturing stderr output (including harmless warnings).
+LOGFILE="/var/log/account_manager_errors.log"
+# Ensure the log file exists and is secured.
+touch "$LOGFILE"
+chmod 600 "$LOGFILE"
+
 # Function: Backup critical system files and /home directory.
 backup_system_files() {
     TIMESTAMP=$(date +%F_%H-%M-%S)
     BACKUP_DIR="/root/backup_${TIMESTAMP}"
     echo "Creating backup directory at $BACKUP_DIR"
-    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR" || { echo "[ERROR] Failed to create backup directory at $BACKUP_DIR"; exit 1; }
     chmod 700 "$BACKUP_DIR"
-    cp /etc/passwd "$BACKUP_DIR/passwd.backup"
-    cp /etc/shadow "$BACKUP_DIR/shadow.backup"
-    cp /etc/group "$BACKUP_DIR/group.backup"
-    cp /etc/gshadow "$BACKUP_DIR/gshadow.backup"
-    tar czf "$BACKUP_DIR/home_backup.tar.gz" /home
-    echo "Backup completed. Files stored in $BACKUP_DIR"
+
+    echo
+    echo "=== Starting Backup ==="
+    cp /etc/passwd "$BACKUP_DIR/passwd.backup" 2>>"$LOGFILE"
+    cp /etc/shadow "$BACKUP_DIR/shadow.backup" 2>>"$LOGFILE"
+    cp /etc/group "$BACKUP_DIR/group.backup" 2>>"$LOGFILE"
+    cp /etc/gshadow "$BACKUP_DIR/gshadow.backup" 2>>"$LOGFILE"
+
+    # Archive /home directory.
+    echo "Backing up /home to $BACKUP_DIR/home_backup.tar.gz..."
+    tar czf "$BACKUP_DIR/home_backup.tar.gz" /home 2>>"$LOGFILE"
+    if [ $? -eq 0 ]; then
+        echo "  [OK] /home backup completed."
+    else
+        echo "  [ERROR] Failed to back up /home. Check $LOGFILE for details."
+    fi
+
+    echo "=== Backup Completed ==="
+    echo "Files stored in $BACKUP_DIR"
+    echo
 }
 
 # Function: Process user accounts (disable or delete).
@@ -57,13 +77,14 @@ process_accounts() {
         exit 0
     fi
 
-    # Display the accounts with an index number.
     echo "Found the following user accounts:"
+    # List each account along with its UID.
     for i in "${!userList[@]}"; do
-        printf "%3d) %s\n" "$((i+1))" "${userList[$i]}"
+        uid=$(getent passwd "${userList[$i]}" | cut -d: -f3)
+        printf "%3d) %s (UID: %s)\n" "$((i+1))" "${userList[$i]}" "$uid"
     done
 
-    # Prompt for which accounts to keep.
+    echo
     read -p "Enter the index numbers (separated by spaces) of accounts you want to keep [default: keep none]: " keepInput
 
     # Convert input into an array of indices.
@@ -94,7 +115,7 @@ process_accounts() {
         echo "No accounts will be kept. All listed accounts will be processed."
     fi
 
-    # Confirm proceeding.
+    echo
     read -p "Are you sure you want to process the remaining accounts? (y/N): " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "Operation cancelled."
@@ -112,13 +133,15 @@ process_accounts() {
         actionChoice="d"
     fi
 
-    # Process each account not in the keep list.
+    echo
+    echo "=== Processing Accounts ==="
     for user in "${userList[@]}"; do
         # Always check the actual account status.
-        status=$(passwd -S "$user" 2>/dev/null | awk '{print $2}')
+        status=$(passwd -S "$user" 2>>"$LOGFILE" | awk '{print $2}')
+
         # If an account in our disabled list is now active, remove it from the disabled file.
         if [ "$status" != "L" ]; then
-            if grep -q "^$user\$" "$DISABLED_FILE"; then
+            if grep -q "^$user\$" "$DISABLED_FILE" 2>/dev/null; then
                 echo "Account $user is active now; removing from disabled list."
                 sed -i "/^$user$/d" "$DISABLED_FILE"
             fi
@@ -131,34 +154,37 @@ process_accounts() {
         fi
 
         if [ "$actionChoice" == "d" ]; then
+            # Disabling the account.
             if [ "$status" == "L" ]; then
                 echo "Account $user is already disabled. Skipping."
             else
                 echo "Disabling account: $user"
-                usermod -L "$user" && chage -E 0 "$user"
+                usermod -L "$user" 2>>"$LOGFILE" && chage -E 0 "$user" 2>>"$LOGFILE"
                 if [ $? -eq 0 ]; then
-                    echo "Account $user disabled successfully."
-                    if ! grep -q "^$user\$" "$DISABLED_FILE"; then
+                    echo "  [OK] Account $user disabled."
+                    if ! grep -q "^$user\$" "$DISABLED_FILE" 2>/dev/null; then
                         echo "$user" >> "$DISABLED_FILE"
                     fi
                 else
-                    echo "Failed to disable account $user."
+                    echo "  [ERROR] Failed to disable account $user. See $LOGFILE for details."
                 fi
             fi
         else
+            # Deleting the account.
             echo "Deleting account: $user"
-            userdel -r "$user"
+            userdel -r "$user" 2>>"$LOGFILE"
             if [ $? -eq 0 ]; then
-                echo "Account $user deleted successfully."
+                echo "  [OK] Account $user deleted."
                 # Log the deleted account for forensic reference.
                 echo "$user $(date +%F_%H-%M-%S)" >> "$DELETED_FILE"
             else
-                echo "Failed to delete account $user."
+                echo "  [ERROR] Failed to delete account $user. See $LOGFILE for details."
             fi
         fi
     done
-
-    echo "Operation completed. Please review /etc/passwd for current user accounts."
+    echo
+    echo "=== Operation Completed ==="
+    echo "Please review /etc/passwd for current user accounts."
 }
 
 # Function: Re-enable previously disabled accounts.
@@ -168,7 +194,6 @@ reenable_accounts() {
         exit 0
     fi
 
-    # Read disabled accounts into an array.
     mapfile -t disabledAccounts < "$DISABLED_FILE"
     if [ ${#disabledAccounts[@]} -eq 0 ]; then
         echo "The disabled accounts file is empty. Nothing to re-enable."
@@ -180,6 +205,7 @@ reenable_accounts() {
         printf "%3d) %s\n" "$((i+1))" "${disabledAccounts[$i]}"
     done
 
+    echo
     read -p "Enter the index numbers (separated by spaces) of accounts you want to re-enable [default: re-enable all]: " reenableInput
 
     reenableIndices=()
@@ -200,7 +226,6 @@ reenable_accounts() {
             reenableUsers+=("${disabledAccounts[$idx]}")
         done
     else
-        # Default: re-enable all.
         reenableUsers=("${disabledAccounts[@]}")
     fi
 
@@ -218,15 +243,15 @@ reenable_accounts() {
 
     for user in "${reenableUsers[@]}"; do
         echo "Re-enabling account: $user"
-        usermod -U "$user" && chage -E -1 "$user"
+        usermod -U "$user" 2>>"$LOGFILE" && chage -E -1 "$user" 2>>"$LOGFILE"
         if [ $? -eq 0 ]; then
-            echo "Account $user re-enabled successfully."
+            echo "  [OK] Account $user re-enabled."
         else
-            echo "Failed to re-enable account $user."
+            echo "  [ERROR] Failed to re-enable account $user. See $LOGFILE for details."
         fi
     done
 
-    # Ask if the disabled accounts list should be cleared.
+    echo
     read -p "Clear the disabled accounts list? (y/N): " clearList
     if [[ "$clearList" =~ ^[Yy]$ ]]; then
         > "$DISABLED_FILE"
