@@ -124,7 +124,7 @@ process_accounts() {
 
     # Prompt for action on the remaining accounts.
     echo "For the remaining accounts, choose the action:"
-    echo "  d) Disable (lock account, expire login)"
+    echo "  d) Disable (lock account, expire login, and delete home directory)"
     echo "  r) Remove (delete account and home directory)"
     read -p "Enter your choice (default is disable): " actionChoice
     actionChoice=${actionChoice:-d}
@@ -164,6 +164,19 @@ process_accounts() {
                     echo "  [OK] Account $user disabled."
                     if ! grep -q "^$user\$" "$DISABLED_FILE" 2>/dev/null; then
                         echo "$user" >> "$DISABLED_FILE"
+                    fi
+                    # Delete the user's home directory.
+                    userHome=$(getent passwd "$user" | cut -d: -f6)
+                    if [ -d "$userHome" ]; then
+                        echo "Deleting home directory for $user at $userHome..."
+                        rm -rf "$userHome" 2>>"$LOGFILE"
+                        if [ $? -eq 0 ]; then
+                            echo "  [OK] Home directory for $user deleted."
+                        else
+                            echo "  [ERROR] Failed to delete home directory for $user. See $LOGFILE for details."
+                        fi
+                    else
+                        echo "No home directory found for $user."
                     fi
                 else
                     echo "  [ERROR] Failed to disable account $user. See $LOGFILE for details."
