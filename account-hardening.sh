@@ -233,4 +233,80 @@ reenable_accounts() {
 
     # Check if the disabled file exists and has content.
     if [ ! -f "$DISABLED_FILE" ]; then
-        echo -e "${YELLOW}No disabled accounts file found at $DISABLED_FILE. Nothing to re-ena
+        echo -e "${YELLOW}No disabled accounts file found at $DISABLED_FILE. Nothing to re-enable.${RESET}"
+        exit 0
+    fi
+
+    mapfile -t disabledAccounts < "$DISABLED_FILE"
+    if [ ${#disabledAccounts[@]} -eq 0 ]; then
+        echo -e "${YELLOW}The disabled accounts file is empty. Nothing to re-enable.${RESET}"
+        exit 0
+    fi
+
+    echo "The following accounts are marked as disabled:"
+    for i in "${!disabledAccounts[@]}"; do
+        printf "  %2d) %s\n" "$((i+1))" "${disabledAccounts[$i]}"
+    done
+
+    echo
+    read -p "Enter the index numbers (separated by spaces) of accounts you want to re-enable [default: re-enable all]: " reenableInput
+
+    reenableIndices=()
+    if [[ -n "$reenableInput" ]]; then
+        for index in $reenableInput; do
+            if [[ "$index" =~ ^[0-9]+$ ]] && [ "$index" -ge 1 ] && [ "$index" -le "${#disabledAccounts[@]}" ]; then
+                reenableIndices+=($((index-1)))
+            else
+                echo -e "${RED}[ERROR]${RESET} Invalid index: $index. Skipping."
+            fi
+        done
+    fi
+
+    # Determine which accounts to re-enable.
+    if [ ${#reenableIndices[@]} -gt 0 ]; then
+        reenableUsers=()
+        for idx in "${reenableIndices[@]}"; do
+            reenableUsers+=("${disabledAccounts[$idx]}")
+        done
+    else
+        reenableUsers=("${disabledAccounts[@]}")
+    fi
+
+    echo -e "\nThe following accounts will be ${GREEN}re-enabled${RESET}:"
+    for user in "${reenableUsers[@]}"; do
+        echo "  $user"
+    done
+
+    read -p "Are you sure you want to re-enable these accounts? (y/N): " confirmReenable
+    if [[ ! "$confirmReenable" =~ ^[Yy]$ ]]; then
+        echo -e "${RED}[ERROR]${RESET} Operation cancelled."
+        exit 1
+    fi
+
+    # Re-enable each selected user (unlock password, remove expiration).
+    for user in "${reenableUsers[@]}"; do
+        echo -e "Re-enabling account: ${YELLOW}$user${RESET}"
+        usermod -U "$user" 2>>"$LOGFILE" && chage -E -1 "$user" 2>>"$LOGFILE"
+        if [ $? -eq 0 ]; then
+            echo -e "  ${GREEN}[OK]${RESET} Account $user re-enabled."
+        else
+            echo -e "  ${RED}[ERROR]${RESET} Failed to re-enable $user. See $LOGFILE for details."
+        fi
+    done
+
+    echo
+    read -p "Clear the disabled accounts list? (y/N): " clearList
+    if [[ "$clearList" =~ ^[Yy]$ ]]; then
+        > "$DISABLED_FILE"
+        echo -e "${GREEN}[OK]${RESET} Disabled accounts list cleared."
+    fi
+}
+
+################################################################
+# Main logic: choose mode based on command-line argument.
+################################################################
+if [ "$1" == "--reenable" ]; then
+    reenable_accounts
+else
+    process_accounts
+fi
