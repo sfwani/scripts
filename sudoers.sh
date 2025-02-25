@@ -1,23 +1,22 @@
 #!/bin/bash
-# Enhanced Account Management Script for Defense Competitions
+# check_sudo_privileges.sh
 #
-# This script performs two primary functions:
-#   1. Process Mode (default): Back up critical files, then list non-root accounts (UID >= threshold),
-#      letting you choose which accounts to keep, and then either disable or delete the rest.
-#      - Disabled accounts are logged for later re-enablement (in /root/disabled_accounts.list).
-#      - Deleted accounts are logged for forensic reference (in /root/deleted_accounts.list).
+# This script audits sudo privileges on the system by:
+#  - Determining which groups have been granted sudo rights (by parsing /etc/sudoers and /etc/sudoers.d/).
+#  - Listing non-root users (with UID >= threshold) along with their group memberships.
+#  - Running "sudo -l -U <user>" to list the sudo commands allowed for each user.
+#  - If the sudo -l command fails (due to system limitations), logs a warning.
+#  - For each user, checks if they belong to any sudo-privileged group and then prompts for each group
+#    whether to remove the user from that group.
+#  - Logs and reports which sudo privileges were removed and which users still have elevated rights.
+#  - Provides general advice on further steps and manual review.
 #
-#   2. Re-enable Mode (--reenable): Display disabled accounts, let you choose which ones to re-enable,
-#      and update the disabled accounts list accordingly.
+# Usage: sudo ./check_sudo_privileges.sh
 #
-# At the end of process mode, the script displays a table summarizing sudo privileges for the kept users.
-#
-# Usage:
-#   Process Mode: sudo ./account_manager.sh
-#   Re-enable Mode: sudo ./account_manager.sh --reenable
+# IMPORTANT: Test this script in a lab environment before using it in a competition.
 
 ################################################################
-# 1. Define Color Variables
+# 1. Define Color Variables for Enhanced Output
 ################################################################
 GREEN="\e[32m"
 RED="\e[31m"
@@ -27,330 +26,198 @@ BOLD="\e[1m"
 RESET="\e[0m"
 
 ################################################################
-# Ensure the script is run as root.
+# 2. Ensure the script is run as root.
 ################################################################
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[ERROR]${RESET} This script must be run as root. Exiting."
     exit 1
 fi
 
-# Files to store the list of disabled and deleted accounts.
-DISABLED_FILE="/root/disabled_accounts.list"
-DELETED_FILE="/root/deleted_accounts.list"
-
-# Log file for capturing stderr output (including harmless warnings).
-LOGFILE="/var/log/account_manager_errors.log"
-
-# Ensure the log file exists and is secured.
-touch "$LOGFILE"
-chmod 600 "$LOGFILE"
+################################################################
+# 3. Set Up Logging & Report File
+################################################################
+REPORT_FILE="/root/sudo_audit_report_$(date +%F_%H-%M-%S).txt"
+touch "$REPORT_FILE" && chmod 600 "$REPORT_FILE"
+LOGFILE="/var/log/sudo_audit_errors.log"
+touch "$LOGFILE" && chmod 600 "$LOGFILE"
+echo -e "Sudo Audit Report - $(date)" > "$REPORT_FILE"
+echo -e "---------------------------------------\n" >> "$REPORT_FILE"
 
 ################################################################
-# Function: Backup critical system files and /home directory.
+# 4. Determine Sudo-Privileged Groups from Sudoers
 ################################################################
-backup_system_files() {
-    # We create a timestamped directory under /root for backups.
-    TIMESTAMP=$(date +%F_%H-%M-%S)
-    BACKUP_DIR="/root/backup_${TIMESTAMP}"
-
-    echo -e "\n${BOLD}${BLUE}=== Starting Backup ===${RESET}"
-    echo -e "Creating backup directory at ${YELLOW}$BACKUP_DIR${RESET}..."
-
-    mkdir -p "$BACKUP_DIR" || { echo -e "${RED}[ERROR]${RESET} Failed to create $BACKUP_DIR"; exit 1; }
-    chmod 700 "$BACKUP_DIR"
-
-    # Copy critical system files for safekeeping.
-    cp /etc/passwd "$BACKUP_DIR/passwd.backup" 2>>"$LOGFILE"
-    cp /etc/shadow "$BACKUP_DIR/shadow.backup" 2>>"$LOGFILE"
-    cp /etc/group "$BACKUP_DIR/group.backup" 2>>"$LOGFILE"
-    cp /etc/gshadow "$BACKUP_DIR/gshadow.backup" 2>>"$LOGFILE"
-
-    # Archive the /home directory for a full backup of user data.
-    echo -e "Backing up /home to ${YELLOW}$BACKUP_DIR/home_backup.tar.gz${RESET}..."
-    tar czf "$BACKUP_DIR/home_backup.tar.gz" /home 2>>"$LOGFILE"
-    if [ $? -eq 0 ]; then
-        echo -e "  ${GREEN}[OK]${RESET} /home backup completed."
-    else
-        echo -e "  ${RED}[ERROR]${RESET} Failed to back up /home. Check $LOGFILE for details."
+priv_groups=()
+# Parse /etc/sudoers for lines beginning with "%" (group definitions)
+while IFS= read -r line; do
+    clean=$(echo "$line" | sed 's/^[[:space:]]*//')
+    if [[ "$clean" =~ ^%([^[:space:]]+) ]]; then
+        group="${BASH_REMATCH[1]}"
+        priv_groups+=("$group")
     fi
+done < /etc/sudoers
 
-    echo -e "${BOLD}${BLUE}=== Backup Completed ===${RESET}"
-    echo -e "Files stored in ${YELLOW}$BACKUP_DIR${RESET}\n"
-}
-
-################################################################
-# Function: Process user accounts (disable or delete).
-################################################################
-process_accounts() {
-    # Indicate which mode we're in (process mode).
-    echo -e "${BOLD}${BLUE}Process mode selected.${RESET}\n"
-
-    # Backup before making any changes.
-    backup_system_files
-
-    # Prompt for UID threshold (default 1000).
-    read -p "Enter the minimum UID to affect (default is 1000): " UID_THRESHOLD
-    UID_THRESHOLD=${UID_THRESHOLD:-1000}
-
-    # Gather list of non-root usernames from /etc/passwd where UID >= threshold.
-    mapfile -t userList < <(awk -F: -v thresh="$UID_THRESHOLD" '($3 >= thresh && $1 != "root") {print $1}' /etc/passwd)
-
-    # If no accounts found, exit.
-    if [ ${#userList[@]} -eq 0 ]; then
-        echo -e "${YELLOW}No user accounts found with UID >= $UID_THRESHOLD.${RESET}"
-        exit 0
-    fi
-
-    # Display the accounts with an index number and show each account's UID.
-    echo -e "Found the following user accounts (UID >= ${YELLOW}$UID_THRESHOLD${RESET}):"
-    for i in "${!userList[@]}"; do
-        uid=$(getent passwd "${userList[$i]}" | cut -d: -f3)
-        printf "  %2d) %s (UID: %s)\n" "$((i+1))" "${userList[$i]}" "$uid"
-    done
-
-    echo
-    read -p "Enter the index numbers (separated by spaces) of accounts you want to keep [default: keep none]: " keepInput
-
-    # Convert input into an array of indices.
-    keepIndices=()
-    if [[ -n "$keepInput" ]]; then
-        for index in $keepInput; do
-            if [[ "$index" =~ ^[0-9]+$ ]] && [ "$index" -ge 1 ] && [ "$index" -le "${#userList[@]}" ]; then
-                keepIndices+=($((index-1)))
-            else
-                echo -e "${RED}[ERROR]${RESET} Invalid index: $index. Skipping."
+# Check /etc/sudoers.d if exists.
+if [ -d /etc/sudoers.d ]; then
+    for file in /etc/sudoers.d/*; do
+        [ -e "$file" ] || continue
+        while IFS= read -r line; do
+            clean=$(echo "$line" | sed 's/^[[:space:]]*//')
+            if [[ "$clean" =~ ^%([^[:space:]]+) ]]; then
+                group="${BASH_REMATCH[1]}"
+                priv_groups+=("$group")
             fi
-        done
-    fi
-
-    # Build list of usernames to keep.
-    keepUsers=()
-    for idx in "${keepIndices[@]}"; do
-        keepUsers+=("${userList[$idx]}")
+        done < "$file"
     done
-
-    echo
-    if [ ${#keepUsers[@]} -gt 0 ]; then
-        echo -e "The following accounts will be ${GREEN}kept${RESET}:"
-        for user in "${keepUsers[@]}"; do
-            echo "  $user"
-        done
-    else
-        echo -e "${YELLOW}No accounts will be kept. All listed accounts will be processed.${RESET}"
-    fi
-
-    echo
-    read -p "Are you sure you want to process the remaining accounts? (y/N): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${RED}[ERROR]${RESET} Operation cancelled."
-        exit 1
-    fi
-
-    # Prompt for action on the remaining accounts.
-    echo -e "For the remaining accounts, choose the action:"
-    echo -e "  d) Disable (lock account, expire login, delete home directory)"
-    echo -e "  r) Remove (delete account and home directory)"
-    read -p "Enter your choice (default is disable): " actionChoice
-    actionChoice=${actionChoice:-d}
-    if [[ "$actionChoice" != "d" && "$actionChoice" != "r" ]]; then
-        echo -e "${RED}[ERROR]${RESET} Invalid option. Defaulting to disable."
-        actionChoice="d"
-    fi
-
-    echo -e "\n${BOLD}${BLUE}=== Processing Accounts ===${RESET}"
-    for user in "${userList[@]}"; do
-        # Always check the actual account status from /etc/shadow.
-        status=$(passwd -S "$user" 2>>"$LOGFILE" | awk '{print $2}')
-
-        # If an account is in our disabled list but is no longer locked, remove it from that file.
-        if [ "$status" != "L" ]; then
-            if grep -q "^$user\$" "$DISABLED_FILE" 2>/dev/null; then
-                echo "Account $user is active now; removing from disabled list."
-                sed -i "/^$user$/d" "$DISABLED_FILE"
-            fi
-        fi
-
-        # Skip accounts that we chose to keep.
-        if [[ " ${keepUsers[*]} " == *" $user "* ]]; then
-            echo -e "Keeping account: ${GREEN}$user${RESET}"
-            continue
-        fi
-
-        # Action: Disable or Remove.
-        if [ "$actionChoice" == "d" ]; then
-            # Disabling the account (lock password, expire login, delete home dir).
-            if [ "$status" == "L" ]; then
-                echo -e "Account $user is already disabled. ${YELLOW}Skipping.${RESET}"
-            else
-                echo -e "Disabling account: ${YELLOW}$user${RESET}"
-                usermod -L "$user" 2>>"$LOGFILE" && chage -E 0 "$user" 2>>"$LOGFILE"
-                if [ $? -eq 0 ]; then
-                    echo -e "  ${GREEN}[OK]${RESET} Account $user disabled."
-                    # Log disabled user if not already logged.
-                    if ! grep -q "^$user\$" "$DISABLED_FILE" 2>/dev/null; then
-                        echo "$user" >> "$DISABLED_FILE"
-                    fi
-
-                    # Delete the user's home directory.
-                    userHome=$(getent passwd "$user" | cut -d: -f6)
-                    if [ -d "$userHome" ]; then
-                        echo "Deleting home directory for $user at $userHome..."
-                        rm -rf "$userHome" 2>>"$LOGFILE"
-                        if [ $? -eq 0 ]; then
-                            echo -e "  ${GREEN}[OK]${RESET} Home directory for $user deleted."
-                        else
-                            echo -e "  ${RED}[ERROR]${RESET} Failed to delete $user's home directory."
-                        fi
-                    else
-                        echo -e "${YELLOW}No home directory found for $user.${RESET}"
-                    fi
-                else
-                    echo -e "  ${RED}[ERROR]${RESET} Failed to disable $user. See $LOGFILE for details."
-                fi
-            fi
-        else
-            # Removing the account entirely with userdel -r.
-            echo -e "Deleting account: ${YELLOW}$user${RESET}"
-            userdel -r "$user" 2>>"$LOGFILE"
-            if [ $? -eq 0 ]; then
-                echo -e "  ${GREEN}[OK]${RESET} Account $user deleted."
-                # Log the deleted account for forensic reference.
-                echo "$user $(date +%F_%H-%M-%S)" >> "$DELETED_FILE"
-            else
-                echo -e "  ${RED}[ERROR]${RESET} Failed to delete $user. See $LOGFILE for details."
-            fi
-        fi
-    done
-
-    echo -e "\n${BOLD}${BLUE}=== Operation Completed ===${RESET}"
-    echo -e "Please review ${YELLOW}/etc/passwd${RESET} for current user accounts."
-
-    ################################################################
-    # 9. Sudo Privilege Summary Table for Remaining (Kept) Users
-    ################################################################
-    echo -e "\n${BOLD}${BLUE}=== Sudo Privilege Summary (Table Format) ===${RESET}"
-
-    # Function to wrap a field to a specific width, replacing newlines with spaces.
-    wrapField() {
-        echo "$1" | fold -s -w "$2" | tr '\n' ' '
-    }
-
-    # Build the header.
-    header="User|UID|Groups|Sudo Privileges"
-    rows=""
-
-    for user in "${keepUsers[@]}"; do
-        uid=$(getent passwd "$user" | cut -d: -f3)
-        groups_text=$(id -nG "$user")
-        # Get sudo privileges, fallback if sudo -l fails.
-        sudo_text=$(sudo -l -U "$user" 2>/dev/null)
-        if [ $? -ne 0 ]; then
-            sudo_text="Could not retrieve sudo privileges; manual check required."
-        fi
-        # Wrap fields.
-        groups_wrapped=$(wrapField "$groups_text" 30)
-        sudo_wrapped=$(wrapField "$sudo_text" 50)
-        row="$user|$uid|$groups_wrapped|$sudo_wrapped"
-        rows+="$row"$'\n'
-    done
-
-    # Print header and rows using column.
-    {
-        echo "$header"
-        echo "$rows"
-    } | column -t -s '|'
-
-    ################################################################
-    # 10. Final Recommendations
-    ################################################################
-    echo -e "\n${BOLD}${BLUE}=== Final Recommendations ===${RESET}"
-    echo -e "1. Manually review any direct sudoers entries in /etc/sudoers and /etc/sudoers.d/."
-    echo -e "2. Check for complex sudoers aliases or Defaults settings not covered by this script."
-    echo -e "3. Confirm that all unwanted sudo privileges have been revoked."
-    echo -e "4. This script handles group-based sudo privileges, but manual review is recommended for complete security."
-    echo -e "\nA detailed report has been saved to ${YELLOW}/root/sudo_audit_report_$(date +%F_%H-%M-%S).txt${RESET} (if you redirect output)."
-
-}
-
-################################################################
-# Function: Re-enable previously disabled accounts.
-################################################################
-reenable_accounts() {
-    echo -e "${BOLD}${BLUE}Re-enable mode selected.${RESET}\n"
-
-    if [ ! -f "$DISABLED_FILE" ]; then
-        echo -e "${YELLOW}No disabled accounts file found at $DISABLED_FILE. Nothing to re-enable.${RESET}"
-        exit 0
-    fi
-
-    mapfile -t disabledAccounts < "$DISABLED_FILE"
-    if [ ${#disabledAccounts[@]} -eq 0 ]; then
-        echo -e "${YELLOW}The disabled accounts file is empty. Nothing to re-enable.${RESET}"
-        exit 0
-    fi
-
-    echo "The following accounts are marked as disabled:"
-    for i in "${!disabledAccounts[@]}"; do
-        printf "  %2d) %s\n" "$((i+1))" "${disabledAccounts[$i]}"
-    done
-
-    echo
-    read -p "Enter the index numbers (separated by spaces) of accounts you want to re-enable [default: re-enable all]: " reenableInput
-
-    reenableIndices=()
-    if [[ -n "$reenableInput" ]]; then
-        for index in $reenableInput; do
-            if [[ "$index" =~ ^[0-9]+$ ]] && [ "$index" -ge 1 ] && [ "$index" -le "${#disabledAccounts[@]}" ]; then
-                reenableIndices+=($((index-1)))
-            else
-                echo -e "${RED}[ERROR]${RESET} Invalid index: $index. Skipping."
-            fi
-        done
-    fi
-
-    if [ ${#reenableIndices[@]} -gt 0 ]; then
-        reenableUsers=()
-        for idx in "${reenableIndices[@]}"; do
-            reenableUsers+=("${disabledAccounts[$idx]}")
-        done
-    else
-        reenableUsers=("${disabledAccounts[@]}")
-    fi
-
-    echo -e "\nThe following accounts will be ${GREEN}re-enabled${RESET}:"
-    for user in "${reenableUsers[@]}"; do
-        echo "  $user"
-    done
-
-    read -p "Are you sure you want to re-enable these accounts? (y/N): " confirmReenable
-    if [[ ! "$confirmReenable" =~ ^[Yy]$ ]]; then
-        echo -e "${RED}[ERROR]${RESET} Operation cancelled."
-        exit 1
-    fi
-
-    for user in "${reenableUsers[@]}"; do
-        echo -e "Re-enabling account: ${YELLOW}$user${RESET}"
-        usermod -U "$user" 2>>"$LOGFILE" && chage -E -1 "$user" 2>>"$LOGFILE"
-        if [ $? -eq 0 ]; then
-            echo -e "  ${GREEN}[OK]${RESET} Account $user re-enabled."
-        else
-            echo -e "  ${RED}[ERROR]${RESET} Failed to re-enable $user. See $LOGFILE for details."
-        fi
-    done
-
-    echo
-    read -p "Clear the disabled accounts list? (y/N): " clearList
-    if [[ "$clearList" =~ ^[Yy]$ ]]; then
-        > "$DISABLED_FILE"
-        echo -e "${GREEN}[OK]${RESET} Disabled accounts list cleared."
-    fi
-}
-
-################################################################
-# Main logic: choose mode based on command-line argument.
-################################################################
-if [ "$1" == "--reenable" ]; then
-    reenable_accounts
-else
-    process_accounts
 fi
+# Remove duplicates.
+readarray -t uniq_priv_groups < <(printf "%s\n" "${priv_groups[@]}" | sort -u)
+
+echo -e "${BLUE}[INFO]${RESET} Sudo-privileged groups detected:" | tee -a "$REPORT_FILE"
+for grp in "${uniq_priv_groups[@]}"; do
+    echo -e "  ${YELLOW}$grp${RESET}" | tee -a "$REPORT_FILE"
+done
+echo "" | tee -a "$REPORT_FILE"
+
+################################################################
+# 5. Set UID Threshold and Gather Non-Root Users
+################################################################
+read -p "Enter the minimum UID to check (default is 1000): " UID_THRESHOLD
+UID_THRESHOLD=${UID_THRESHOLD:-1000}
+
+# Get non-root users with UID >= threshold.
+userList=( $(awk -F: -v thresh="$UID_THRESHOLD" '($3 >= thresh && $1!="root") {print $1}' /etc/passwd) )
+if [ ${#userList[@]} -eq 0 ]; then
+    echo -e "${YELLOW}No non-root users found with UID >= $UID_THRESHOLD.${RESET}"
+    exit 0
+fi
+
+echo -e "\n${BOLD}${BLUE}=== Sudo Privilege Audit ===${RESET}" | tee -a "$REPORT_FILE"
+
+################################################################
+# 6. Audit Each User's Sudo Privileges and Group Membership
+################################################################
+for user in "${userList[@]}"; do
+    echo -e "\n${BOLD}${YELLOW}User: $user${RESET}" | tee -a "$REPORT_FILE"
+    userGroups=$(id "$user")
+    echo -e "${BOLD}Group Membership:${RESET} $userGroups" | tee -a "$REPORT_FILE"
+    
+    # Check if user is in any sudo-privileged group.
+    user_grp_list=$(id -nG "$user")
+    matching_groups=()
+    for grp in "${uniq_priv_groups[@]}"; do
+        if echo "$user_grp_list" | grep -qw "$grp"; then
+            matching_groups+=("$grp")
+        fi
+    done
+
+    if [ ${#matching_groups[@]} -gt 0 ]; then
+        echo -e "${BOLD}[INFO]${RESET} $user belongs to sudo-privileged group(s): ${YELLOW}${matching_groups[*]}${RESET}" | tee -a "$REPORT_FILE"
+    else
+        echo -e "${BOLD}[INFO]${RESET} $user does not belong to any recognized sudo-privileged groups." | tee -a "$REPORT_FILE"
+    fi
+
+    # List sudo privileges using sudo -l -U. Fallback if not supported.
+    echo -e "${BOLD}Sudo privileges (via sudo -l -U $user):${RESET}" | tee -a "$REPORT_FILE"
+    sudo_output=$(sudo -l -U "$user" 2>&1)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}[WARNING]${RESET} Could not retrieve sudo privileges for $user. Output:" | tee -a "$REPORT_FILE"
+        echo "$sudo_output" | tee -a "$REPORT_FILE"
+    else
+        echo "$sudo_output" | tee -a "$REPORT_FILE"
+    fi
+    echo "--------------------------------------------------" | tee -a "$REPORT_FILE"
+done
+
+################################################################
+# 7. Prompt to Remove Sudo Privileges via Group Membership
+################################################################
+echo -e "\n${BOLD}${BLUE}=== Sudo Group Membership Removal ===${RESET}" | tee -a "$REPORT_FILE"
+for user in "${userList[@]}"; do
+    # Check groups for each user.
+    user_grp_list=$(id -nG "$user")
+    matching_groups=()
+    for grp in "${uniq_priv_groups[@]}"; do
+        if echo "$user_grp_list" | grep -qw "$grp"; then
+            matching_groups+=("$grp")
+        fi
+    done
+
+    # If the user is in any sudo-privileged group, prompt per group.
+    if [ ${#matching_groups[@]} -gt 0 ]; then
+        for grp in "${matching_groups[@]}"; do
+            read -p "User $user is in group '$grp' (sudo privileges). Remove $user from this group? (y/N): " remove_choice
+            if [[ "$remove_choice" =~ ^[Yy]$ ]]; then
+                if command -v gpasswd >/dev/null 2>&1; then
+                    gpasswd -d "$user" "$grp" 2>>"$LOGFILE"
+                else
+                    deluser "$user" "$grp" 2>>"$LOGFILE"
+                fi
+                if [ $? -eq 0 ]; then
+                    echo -e "  ${GREEN}[OK]${RESET} Removed $user from $grp." | tee -a "$REPORT_FILE"
+                else
+                    echo -e "  ${RED}[ERROR]${RESET} Failed to remove $user from $grp. Check $LOGFILE for details." | tee -a "$REPORT_FILE"
+                fi
+            else
+                echo -e "  ${YELLOW}[INFO]${RESET} Kept $user in group $grp." | tee -a "$REPORT_FILE"
+            fi
+        done
+    fi
+done
+
+################################################################
+# 8. Final Summary and Recommendations
+################################################################
+echo -e "\n${BOLD}${BLUE}=== Audit Completed ===${RESET}" | tee -a "$REPORT_FILE"
+echo -e "Review the above output for sudo privileges and group memberships." | tee -a "$REPORT_FILE"
+
+echo -e "\n${BOLD}Recommendations:${RESET}" | tee -a "$REPORT_FILE"
+echo -e "  - Manually review any direct sudoers entries (not handled by group membership) in:" | tee -a "$REPORT_FILE"
+echo -e "      /etc/sudoers and /etc/sudoers.d/" | tee -a "$REPORT_FILE"
+echo -e "  - Check for complex aliases or Defaults settings that may grant elevated privileges." | tee -a "$REPORT_FILE"
+echo -e "  - This script covers group-based sudo privileges but may not catch every nuance in sudoers." | tee -a "$REPORT_FILE"
+echo -e "  - Further hardening might include editing /etc/sudoers manually using visudo." | tee -a "$REPORT_FILE"
+
+################################################################
+# 9. Sudo Privilege Summary Table for Remaining (Kept) Users
+################################################################
+echo -e "\n${BOLD}${BLUE}=== Sudo Privilege Summary Table ===${RESET}"
+# Build table header: User | UID | Groups | Sudo Privileges
+header="User|UID|Groups|Sudo Privileges"
+rows=""
+# Function to wrap text to a fixed width.
+wrapText() {
+    echo "$1" | fold -s -w "$2" | tr '\n' ' '
+}
+
+for user in "${keepUsers[@]}"; do
+    uid=$(getent passwd "$user" | cut -d: -f3)
+    groups_text=$(id -nG "$user")
+    sudo_text=$(sudo -l -U "$user" 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        sudo_text="[WARNING] Unable to retrieve sudo privileges; manual check required."
+    fi
+    # Wrap the Groups to 30 characters and sudo_text to 50 characters.
+    groups_wrapped=$(wrapText "$groups_text" 30)
+    sudo_wrapped=$(wrapText "$sudo_text" 50)
+    row="$user|$uid|$groups_wrapped|$sudo_wrapped"
+    rows+="$row"$'\n'
+done
+
+# Print the table header and rows using column.
+{
+    echo "$header"
+    echo "$rows"
+} | column -t -s '|'
+
+################################################################
+# 10. Final Recommendations and Next Steps
+################################################################
+echo -e "\n${BOLD}${BLUE}=== Final Recommendations ===${RESET}"
+echo -e "1. Manually review any direct sudoers entries in /etc/sudoers and /etc/sudoers.d/." 
+echo -e "2. Check for complex sudoers aliases or Defaults settings not covered by this script."
+echo -e "3. Confirm that all unwanted sudo privileges have been revoked."
+echo -e "4. Use visudo to edit /etc/sudoers manually if further hardening is required."
+echo -e "\nA final report has been saved to ${YELLOW}$REPORT_FILE${RESET}"
+echo -e "Please perform a manual review of your sudoers configuration for complete security assurance.\n" | tee -a "$REPORT_FILE"
+
+exit 0
